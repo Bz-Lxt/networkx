@@ -6,7 +6,7 @@ from functools import cached_property
 import networkx as nx
 from networkx import convert
 from networkx.classes.coreviews import AdjacencyView
-from networkx.classes.graph import Graph
+from networkx.classes.graph import Graph, _copy_atlas, _restore_atlas
 from networkx.classes.reportviews import (
     DiDegreeView,
     InDegreeView,
@@ -383,12 +383,25 @@ class DiGraph(Graph):
         # Note: self._succ = self._adj  # successor
 
         self.__networkx_cache__ = {}
+        # State of the (possibly nested) batch update; see Graph.__init__.
+        self._batch_state = None
         # attempt to load graph with data
         if incoming_graph_data is not None:
             convert.to_networkx_graph(incoming_graph_data, create_using=self)
         # load graph attributes (must be after convert)
         attr.pop("backend", None)  # Ignore explicit `backend="networkx"`
         self.graph.update(attr)
+
+    def _batch_copy_structures(self, memo):
+        # See Graph._batch_copy_structures; directed graphs additionally store
+        # predecessors. ``memo`` is shared with the successor copy so that an
+        # edge-data dict shared by ``_succ`` and ``_pred`` stays shared.
+        yield from super()._batch_copy_structures(memo)
+        yield "pred", _copy_atlas(self._pred, self._batch_adj_depth, memo)
+
+    def _batch_restore_structures(self, snapshot):
+        super()._batch_restore_structures(snapshot)
+        _restore_atlas(self._pred, snapshot["pred"], self._batch_adj_depth)
 
     @cached_property
     def adj(self):
@@ -494,7 +507,7 @@ class DiGraph(Graph):
             attr_dict.update(attr)
         else:  # update attr even if node already exists
             self._node[node_for_adding].update(attr)
-        nx._clear_cache(self)
+        self._mutation_done()
 
     def add_nodes_from(self, nodes_for_adding, **attr):
         """Add multiple nodes.
@@ -557,23 +570,23 @@ class DiGraph(Graph):
         >>> # correct way
         >>> G.add_nodes_from(list(n + 1 for n in G.nodes))
         """
-        for n in nodes_for_adding:
-            try:
-                newnode = n not in self._node
-                newdict = attr
-            except TypeError:
-                n, ndict = n
-                newnode = n not in self._node
-                newdict = attr.copy()
-                newdict.update(ndict)
-            if newnode:
-                if n is None:
-                    raise ValueError("None cannot be a node")
-                self._succ[n] = self.adjlist_inner_dict_factory()
-                self._pred[n] = self.adjlist_inner_dict_factory()
-                self._node[n] = self.node_attr_dict_factory()
-            self._node[n].update(newdict)
-        nx._clear_cache(self)
+        with self._batch():
+            for n in nodes_for_adding:
+                try:
+                    newnode = n not in self._node
+                    newdict = attr
+                except TypeError:
+                    n, ndict = n
+                    newnode = n not in self._node
+                    newdict = attr.copy()
+                    newdict.update(ndict)
+                if newnode:
+                    if n is None:
+                        raise ValueError("None cannot be a node")
+                    self._succ[n] = self.adjlist_inner_dict_factory()
+                    self._pred[n] = self.adjlist_inner_dict_factory()
+                    self._node[n] = self.node_attr_dict_factory()
+                self._node[n].update(newdict)
 
     def remove_node(self, n):
         """Remove node n.
@@ -616,7 +629,7 @@ class DiGraph(Graph):
         for u in self._pred[n]:
             del self._succ[u][n]  # remove all edges n-u in digraph
         del self._pred[n]  # remove node from pred
-        nx._clear_cache(self)
+        self._mutation_done()
 
     def remove_nodes_from(self, nodes):
         """Remove multiple nodes.
@@ -659,19 +672,19 @@ class DiGraph(Graph):
         >>> # this command will work, since the dictionary underlying graph is not modified
         >>> G.remove_nodes_from(list(n for n in G.nodes if n < 2))
         """
-        for n in nodes:
-            try:
-                succs = self._succ[n]
-                del self._node[n]
-                for u in succs:
-                    del self._pred[u][n]  # remove all edges n-u in digraph
-                del self._succ[n]  # now remove node
-                for u in self._pred[n]:
-                    del self._succ[u][n]  # remove all edges n-u in digraph
-                del self._pred[n]  # now remove node
-            except KeyError:
-                pass  # silent failure on remove
-        nx._clear_cache(self)
+        with self._batch():
+            for n in nodes:
+                try:
+                    succs = self._succ[n]
+                    del self._node[n]
+                    for u in succs:
+                        del self._pred[u][n]  # remove all edges n-u in digraph
+                    del self._succ[n]  # now remove node
+                    for u in self._pred[n]:
+                        del self._succ[u][n]  # remove all edges n-u in digraph
+                    del self._pred[n]  # now remove node
+                except KeyError:
+                    pass  # silent failure on remove
 
     def add_edge(self, u_of_edge, v_of_edge, **attr):
         """Add an edge between u and v.
@@ -742,7 +755,7 @@ class DiGraph(Graph):
         datadict.update(attr)
         self._succ[u][v] = datadict
         self._pred[v][u] = datadict
-        nx._clear_cache(self)
+        self._mutation_done()
 
     def add_edges_from(self, ebunch_to_add, **attr):
         """Add all the edges in ebunch_to_add.
@@ -799,33 +812,35 @@ class DiGraph(Graph):
         >>> # right way - note that there will be no self-edge for node 5
         >>> G.add_edges_from(list((5, n) for n in G.nodes))
         """
-        for e in ebunch_to_add:
-            ne = len(e)
-            if ne == 3:
-                u, v, dd = e
-            elif ne == 2:
-                u, v = e
-                dd = {}
-            else:
-                raise nx.NetworkXError(f"Edge tuple {e} must be a 2-tuple or 3-tuple.")
-            if u not in self._succ:
-                if u is None:
-                    raise ValueError("None cannot be a node")
-                self._succ[u] = self.adjlist_inner_dict_factory()
-                self._pred[u] = self.adjlist_inner_dict_factory()
-                self._node[u] = self.node_attr_dict_factory()
-            if v not in self._succ:
-                if v is None:
-                    raise ValueError("None cannot be a node")
-                self._succ[v] = self.adjlist_inner_dict_factory()
-                self._pred[v] = self.adjlist_inner_dict_factory()
-                self._node[v] = self.node_attr_dict_factory()
-            datadict = self._adj[u].get(v, self.edge_attr_dict_factory())
-            datadict.update(attr)
-            datadict.update(dd)
-            self._succ[u][v] = datadict
-            self._pred[v][u] = datadict
-        nx._clear_cache(self)
+        with self._batch():
+            for e in ebunch_to_add:
+                ne = len(e)
+                if ne == 3:
+                    u, v, dd = e
+                elif ne == 2:
+                    u, v = e
+                    dd = {}
+                else:
+                    raise nx.NetworkXError(
+                        f"Edge tuple {e} must be a 2-tuple or 3-tuple."
+                    )
+                if u not in self._succ:
+                    if u is None:
+                        raise ValueError("None cannot be a node")
+                    self._succ[u] = self.adjlist_inner_dict_factory()
+                    self._pred[u] = self.adjlist_inner_dict_factory()
+                    self._node[u] = self.node_attr_dict_factory()
+                if v not in self._succ:
+                    if v is None:
+                        raise ValueError("None cannot be a node")
+                    self._succ[v] = self.adjlist_inner_dict_factory()
+                    self._pred[v] = self.adjlist_inner_dict_factory()
+                    self._node[v] = self.node_attr_dict_factory()
+                datadict = self._adj[u].get(v, self.edge_attr_dict_factory())
+                datadict.update(attr)
+                datadict.update(dd)
+                self._succ[u][v] = datadict
+                self._pred[v][u] = datadict
 
     def remove_edge(self, u, v):
         """Remove the edge between u and v.
@@ -859,7 +874,7 @@ class DiGraph(Graph):
             del self._pred[v][u]
         except KeyError as err:
             raise nx.NetworkXError(f"The edge {u}-{v} not in graph.") from err
-        nx._clear_cache(self)
+        self._mutation_done()
 
     def remove_edges_from(self, ebunch):
         """Remove all edges specified in ebunch.
@@ -887,12 +902,12 @@ class DiGraph(Graph):
         >>> ebunch = [(1, 2), (2, 3)]
         >>> G.remove_edges_from(ebunch)
         """
-        for e in ebunch:
-            u, v = e[:2]  # ignore edge data
-            if u in self._succ and v in self._succ[u]:
-                del self._succ[u][v]
-                del self._pred[v][u]
-        nx._clear_cache(self)
+        with self._batch():
+            for e in ebunch:
+                u, v = e[:2]  # ignore edge data
+                if u in self._succ and v in self._succ[u]:
+                    del self._succ[u][v]
+                    del self._pred[v][u]
 
     def has_successor(self, u, v):
         """Returns True if node u has successor v.
@@ -1232,7 +1247,7 @@ class DiGraph(Graph):
         self._pred.clear()
         self._node.clear()
         self.graph.clear()
-        nx._clear_cache(self)
+        self._mutation_done()
 
     def clear_edges(self):
         """Remove all edges from the graph without altering nodes.
@@ -1251,7 +1266,7 @@ class DiGraph(Graph):
             predecessor_dict.clear()
         for successor_dict in self._succ.values():
             successor_dict.clear()
-        nx._clear_cache(self)
+        self._mutation_done()
 
     def is_multigraph(self):
         """Returns True if graph is a multigraph, False otherwise."""

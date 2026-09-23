@@ -700,23 +700,23 @@ def set_node_attributes(G, values, name=None):
 
     """
     # Set node attributes based on type of `values`
-    if name is not None:  # `values` must not be a dict of dict
-        try:  # `values` is a dict
-            for n, v in values.items():
+    with G._batch():
+        if name is not None:  # `values` must not be a dict of dict
+            try:  # `values` is a dict
+                for n, v in values.items():
+                    try:
+                        G.nodes[n][name] = v
+                    except KeyError:
+                        pass
+            except AttributeError:  # `values` is a constant
+                for n in G:
+                    G.nodes[n][name] = values
+        else:  # `values` must be dict of dict
+            for n, d in values.items():
                 try:
-                    G.nodes[n][name] = values[n]
+                    G.nodes[n].update(d)
                 except KeyError:
                     pass
-        except AttributeError:  # `values` is a constant
-            for n in G:
-                G.nodes[n][name] = values
-    else:  # `values` must be dict of dict
-        for n, d in values.items():
-            try:
-                G.nodes[n].update(d)
-            except KeyError:
-                pass
-    nx._clear_cache(G)
 
 
 @nx._dispatchable(node_attrs={"name": "default"})
@@ -786,14 +786,14 @@ def remove_node_attributes(G, *attr_names, nbunch=None):
     if nbunch is None:
         nbunch = G.nodes()
 
-    for attr in attr_names:
-        for n, d in G.nodes(data=True):
-            if n in nbunch:
-                try:
-                    del d[attr]
-                except KeyError:
-                    pass
-    nx._clear_cache(G)
+    with G._batch():
+        for attr in attr_names:
+            for n, d in G.nodes(data=True):
+                if n in nbunch:
+                    try:
+                        del d[attr]
+                    except KeyError:
+                        pass
 
 
 @nx._dispatchable(preserve_edge_attrs=True, mutates_input=True)
@@ -898,41 +898,41 @@ def set_edge_attributes(G, values, name=None):
         {(0, 1): 7}
 
     """
-    if name is not None:
-        # `values` does not contain attribute names
-        try:
-            # if `values` is a dict using `.items()` => {edge: value}
+    with G._batch():
+        if name is not None:
+            # `values` does not contain attribute names
+            try:
+                # if `values` is a dict using `.items()` => {edge: value}
+                if G.is_multigraph():
+                    for (u, v, key), value in values.items():
+                        try:
+                            G._adj[u][v][key][name] = value
+                        except KeyError:
+                            pass
+                else:
+                    for (u, v), value in values.items():
+                        try:
+                            G._adj[u][v][name] = value
+                        except KeyError:
+                            pass
+            except AttributeError:
+                # treat `values` as a constant
+                for u, v, data in G.edges(data=True):
+                    data[name] = values
+        else:
+            # `values` consists of doct-of-dict {edge: {attr: value}} shape
             if G.is_multigraph():
-                for (u, v, key), value in values.items():
+                for (u, v, key), d in values.items():
                     try:
-                        G._adj[u][v][key][name] = value
+                        G._adj[u][v][key].update(d)
                     except KeyError:
                         pass
             else:
-                for (u, v), value in values.items():
+                for (u, v), d in values.items():
                     try:
-                        G._adj[u][v][name] = value
+                        G._adj[u][v].update(d)
                     except KeyError:
                         pass
-        except AttributeError:
-            # treat `values` as a constant
-            for u, v, data in G.edges(data=True):
-                data[name] = values
-    else:
-        # `values` consists of doct-of-dict {edge: {attr: value}} shape
-        if G.is_multigraph():
-            for (u, v, key), d in values.items():
-                try:
-                    G._adj[u][v][key].update(d)
-                except KeyError:
-                    pass
-        else:
-            for (u, v), d in values.items():
-                try:
-                    G._adj[u][v].update(d)
-                except KeyError:
-                    pass
-    nx._clear_cache(G)
 
 
 @nx._dispatchable(edge_attrs={"name": "default"})
@@ -1005,17 +1005,18 @@ def remove_edge_attributes(G, *attr_names, ebunch=None):
     if ebunch is None:
         ebunch = G.edges(keys=True) if G.is_multigraph() else G.edges()
 
-    for attr in attr_names:
-        edges = (
-            G.edges(keys=True, data=True) if G.is_multigraph() else G.edges(data=True)
-        )
-        for *e, d in edges:
-            if tuple(e) in ebunch:
-                try:
-                    del d[attr]
-                except KeyError:
-                    pass
-    nx._clear_cache(G)
+    with G._batch():
+        for attr in attr_names:
+            if G.is_multigraph():
+                edges = G.edges(keys=True, data=True)
+            else:
+                edges = G.edges(data=True)
+            for *e, d in edges:
+                if tuple(e) in ebunch:
+                    try:
+                        del d[attr]
+                    except KeyError:
+                        pass
 
 
 def all_neighbors(graph, node):

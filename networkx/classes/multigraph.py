@@ -291,6 +291,9 @@ class MultiGraph(Graph):
     edge_key_dict_factory = dict
     # edge_attr_dict_factory = dict
 
+    # MultiGraph adjacency has one extra level: node -> neighbor -> key -> data
+    _batch_adj_depth = 3
+
     def to_directed_class(self):
         """Returns the class to use for empty directed copies.
 
@@ -532,7 +535,7 @@ class MultiGraph(Graph):
             keydict[key] = datadict
             self._adj[u][v] = keydict
             self._adj[v][u] = keydict
-        nx._clear_cache(self)
+        self._mutation_done()
         return key
 
     def add_edges_from(self, ebunch_to_add, **attr):
@@ -604,32 +607,32 @@ class MultiGraph(Graph):
         >>> assigned_keys = G.add_edges_from(list((5, n) for n in G.nodes))
         """
         keylist = []
-        for e in ebunch_to_add:
-            ne = len(e)
-            if ne == 4:
-                u, v, key, dd = e
-            elif ne == 3:
-                u, v, dd = e
-                key = None
-            elif ne == 2:
-                u, v = e
-                dd = {}
-                key = None
-            else:
-                msg = f"Edge tuple {e} must be a 2-tuple, 3-tuple or 4-tuple."
-                raise NetworkXError(msg)
-            ddd = {}
-            ddd.update(attr)
-            try:
-                ddd.update(dd)
-            except (TypeError, ValueError):
-                if ne != 3:
-                    raise
-                key = dd  # ne == 3 with 3rd value not dict, must be a key
-            key = self.add_edge(u, v, key)
-            self[u][v][key].update(ddd)
-            keylist.append(key)
-        nx._clear_cache(self)
+        with self._batch():
+            for e in ebunch_to_add:
+                ne = len(e)
+                if ne == 4:
+                    u, v, key, dd = e
+                elif ne == 3:
+                    u, v, dd = e
+                    key = None
+                elif ne == 2:
+                    u, v = e
+                    dd = {}
+                    key = None
+                else:
+                    msg = f"Edge tuple {e} must be a 2-tuple, 3-tuple or 4-tuple."
+                    raise NetworkXError(msg)
+                ddd = {}
+                ddd.update(attr)
+                try:
+                    ddd.update(dd)
+                except (TypeError, ValueError):
+                    if ne != 3:
+                        raise
+                    key = dd  # ne == 3 with 3rd value not dict, must be a key
+                key = self.add_edge(u, v, key)
+                self[u][v][key].update(ddd)
+                keylist.append(key)
         return keylist
 
     def remove_edge(self, u, v, key=None):
@@ -709,7 +712,7 @@ class MultiGraph(Graph):
             del self._adj[u][v]
             if u != v:  # check for selfloop
                 del self._adj[v][u]
-        nx._clear_cache(self)
+        self._mutation_done()
 
     def remove_edges_from(self, ebunch):
         """Remove all edges specified in ebunch.
@@ -763,12 +766,12 @@ class MultiGraph(Graph):
         MultiEdgeView([(0, 1, 'x'), (0, 1, 'y')])
 
         """
-        for e in ebunch:
-            try:
-                self.remove_edge(*e[:3])
-            except NetworkXError:
-                pass
-        nx._clear_cache(self)
+        with self._batch():
+            for e in ebunch:
+                try:
+                    self.remove_edge(*e[:3])
+                except NetworkXError:
+                    pass
 
     def has_edge(self, u, v, key=None):
         """Returns True if the graph has an edge between nodes u and v.

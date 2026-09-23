@@ -8,7 +8,8 @@ Self-loops are allowed but multiple edges are not (see MultiGraph).
 For directed graphs see DiGraph and MultiDiGraph.
 """
 
-from copy import deepcopy
+from contextlib import contextmanager
+from copy import copy, deepcopy
 from functools import cached_property
 
 import networkx as nx
@@ -17,6 +18,81 @@ from networkx.classes.coreviews import AdjacencyView
 from networkx.classes.reportviews import DegreeView, EdgeView, NodeView
 
 __all__ = ["Graph"]
+
+
+def _copy_leaf(value, memo):
+    """Shallow-copy a leaf attribute dictionary/value, tracking shared objects.
+
+    Objects that are shared within the live data structure (e.g. a single
+    edge-data dictionary stored under both endpoints of an edge) are copied
+    once and the copy is reused, so sharing is preserved in the snapshot.
+    """
+    marker = id(value)
+    if marker not in memo:
+        memo[marker] = copy(value)
+    return memo[marker]
+
+
+def _copy_atlas(atlas, depth, memo):
+    """Return a structural copy of a dict-of-...-dict data structure.
+
+    ``depth`` gives the number of remaining *structural* dictionary levels.
+    At the last level the values are edge/node attribute dictionaries and are
+    shallow-copied (see `_copy_leaf`); at every other level the dictionary is
+    rebuilt with the same type as the live one. Node and edge keys are always
+    kept by reference (they are hashable identifiers and must not be copied).
+    """
+    marker = id(atlas)
+    if marker in memo:
+        # The same structural dict (e.g. a MultiGraph key-dict shared by both
+        # endpoints) must map to a single shared copy.
+        return memo[marker]
+    clone = type(atlas)()
+    memo[marker] = clone
+    if depth <= 1:
+        for key, value in atlas.items():
+            clone[key] = _copy_leaf(value, memo)
+    else:
+        for key, value in atlas.items():
+            clone[key] = _copy_atlas(value, depth - 1, memo)
+    return clone
+
+
+def _restore_atlas(live, snapshot, depth):
+    """Restore ``live`` structural dict contents in place from ``snapshot``.
+
+    The top-level (and every surviving inner) dictionary object is never
+    replaced: keys added during the failed batch are deleted, keys deleted
+    during the batch are reinserted using the snapshot objects, surviving
+    attribute dictionaries are refilled in place and the original key
+    insertion order is reconstructed. This keeps every outstanding view into
+    the graph (which references these dictionary objects) valid.
+    """
+    for key in list(live):
+        if key not in snapshot:
+            del live[key]
+    if depth <= 1:
+        for key, value in snapshot.items():
+            if key in live:
+                target = live.pop(key)
+                live[key] = target  # restore key position, keep object identity
+                # ``target is value`` when an alias restored on an earlier
+                # visit reinserted this very snapshot dictionary; it is
+                # already pristine, so clearing it would also empty ``value``.
+                if target is not value:
+                    target.clear()
+                    target.update(value)
+            else:
+                live[key] = value
+    else:
+        for key, value in snapshot.items():
+            if key in live:
+                inner = live.pop(key)
+                live[key] = inner  # restore key position, keep object identity
+                if inner is not value:
+                    _restore_atlas(inner, value, depth - 1)
+            else:
+                live[key] = value
 
 
 class _CachedPropertyResetterAdj:
@@ -319,6 +395,12 @@ class Graph:
     edge_attr_dict_factory = dict
     graph_attr_dict_factory = dict
 
+    # Number of structural dictionary levels in ``self._adj`` (and
+    # ``self._pred`` for directed graphs): Graph/DiGraph use a
+    # dict-of-dict-of-dict structure, MultiGraph/MultiDiGraph add one more
+    # level for the edge key. Used by the batch snapshot/restore machinery.
+    _batch_adj_depth = 2
+
     def to_directed_class(self):
         """Returns the class to use for empty directed copies.
 
@@ -382,12 +464,131 @@ class Graph:
         self._node = self.node_dict_factory()  # empty node attribute dict
         self._adj = self.adjlist_outer_dict_factory()  # empty adjacency dict
         self.__networkx_cache__ = {}
+        # State of the (possibly nested) batch update; ``None`` means that no
+        # batch is active. Otherwise a dict with the nesting ``depth`` and the
+        # ``snapshot`` taken when the outermost batch was entered.
+        self._batch_state = None
         # attempt to load graph with data
         if incoming_graph_data is not None:
             convert.to_networkx_graph(incoming_graph_data, create_using=self)
         # load graph attributes (must be after convert)
         attr.pop("backend", None)  # Ignore explicit `backend="networkx"`
         self.graph.update(attr)
+
+    @contextmanager
+    def batch(self):
+        """Context manager grouping graph updates into one atomic batch.
+
+        All node, edge and graph attribute updates made inside the ``with``
+        block are applied in place and in the usual order, but they are
+        committed as a single unit: when the block exits without an exception
+        the converted-graph cache is cleared exactly once, and if any update
+        raises (including an iterator failing partway through) the graph is
+        restored to the exact structure, attributes, cache and view state it
+        had before the outermost batch was entered.
+
+        Batches can be nested. Updates performed inside an inner batch take
+        part in the surrounding transaction; an exception anywhere unwinds the
+        whole batch. Outside of a batch the individual ``add_node``,
+        ``add_edge``, etc. methods keep their usual immediate, item-by-item
+        behavior.
+
+        Examples
+        --------
+        >>> G = nx.path_graph(3)
+        >>> try:
+        ...     with G.batch():
+        ...         G.add_edges_from([(2, 3), (3, 4, 10, 20)])  # invalid edge tuple
+        ... except nx.NetworkXError:
+        ...     pass
+        >>> list(G.edges)
+        [(0, 1), (1, 2)]
+        """
+        with self._batch():
+            yield
+
+    @contextmanager
+    def _batch(self):
+        """Run a group of updates as one transaction; nested batches join in.
+
+        The outermost batch takes a snapshot and is responsible for the
+        single commit (cache clear) on success or for restoring the snapshot
+        on failure. Inner batches only track the nesting depth.
+        """
+        state = self.__dict__.get("_batch_state")
+        outer = state is None
+        if outer:
+            state = {"depth": 0, "snapshot": self._snapshot_state()}
+            self.__dict__["_batch_state"] = state
+        state["depth"] += 1
+        try:
+            yield
+        except BaseException:
+            state["depth"] -= 1
+            if outer:
+                self.__dict__["_batch_state"] = None
+                self._restore_state(state["snapshot"])
+            raise
+        else:
+            state["depth"] -= 1
+            if outer:
+                self.__dict__["_batch_state"] = None
+                nx._clear_cache(self)
+
+    def _mutation_done(self):
+        """Report a completed mutation, honoring an active batch.
+
+        Outside a batch this clears the converted-graph cache immediately,
+        exactly as a direct call to :func:`networkx._clear_cache` would.
+        Inside a batch the cache is left untouched; it is cleared once when
+        the outermost batch commits.
+        """
+        if self.__dict__.get("_batch_state") is None:
+            nx._clear_cache(self)
+
+    def _snapshot_state(self):
+        """Return a snapshot of all graph state that a batch may modify."""
+        memo = {}
+        snapshot = dict(self._batch_copy_structures(memo))
+        snapshot["graph"] = {
+            key: _copy_leaf(value, memo) for key, value in self.graph.items()
+        }
+        # ``__networkx_cache__`` may be ``None`` when caching was disabled.
+        cache = self.__networkx_cache__
+        snapshot["cache"] = dict(cache) if cache is not None else None
+        return snapshot
+
+    def _batch_copy_structures(self, memo):
+        """Yield ``(name, copy)`` pairs of the structural dictionaries.
+
+        Subclasses (DiGraph) extend this to snapshot additional structures.
+        The same ``memo`` is shared so that dictionaries aliased across
+        structures (e.g. an edge-data dict shared by ``_adj`` and ``_pred``)
+        remain shared in the snapshot.
+        """
+        yield "node", _copy_atlas(self._node, 1, memo)
+        yield "adj", _copy_atlas(self._adj, self._batch_adj_depth, memo)
+
+    def _restore_state(self, snapshot):
+        """Restore the graph in place from a snapshot taken before a batch."""
+        self._batch_restore_structures(snapshot)
+        graph = self.graph
+        for key in list(graph):
+            if key not in snapshot["graph"]:
+                del graph[key]
+        # pop + reinsert also reconstructs the original attribute order
+        for key, value in snapshot["graph"].items():
+            graph.pop(key, None)
+            graph[key] = value
+        cache = self.__networkx_cache__
+        if cache is not None:
+            cache.clear()
+            cache.update(snapshot["cache"])
+
+    def _batch_restore_structures(self, snapshot):
+        """Restore the structural dictionaries from a snapshot."""
+        _restore_atlas(self._node, snapshot["node"], 1)
+        _restore_atlas(self._adj, snapshot["adj"], self._batch_adj_depth)
 
     @cached_property
     def adj(self):
@@ -421,7 +622,7 @@ class Graph:
     @name.setter
     def name(self, s):
         self.graph["name"] = s
-        nx._clear_cache(self)
+        self._mutation_done()
 
     def __str__(self):
         """Returns a short summary of the graph.
@@ -578,7 +779,7 @@ class Graph:
             attr_dict.update(attr)
         else:  # update attr even if node already exists
             self._node[node_for_adding].update(attr)
-        nx._clear_cache(self)
+        self._mutation_done()
 
     def add_nodes_from(self, nodes_for_adding, **attr):
         """Add multiple nodes.
@@ -641,22 +842,22 @@ class Graph:
         >>> # correct way
         >>> G.add_nodes_from(list(n + 1 for n in G.nodes))
         """
-        for n in nodes_for_adding:
-            try:
-                newnode = n not in self._node
-                newdict = attr
-            except TypeError:
-                n, ndict = n
-                newnode = n not in self._node
-                newdict = attr.copy()
-                newdict.update(ndict)
-            if newnode:
-                if n is None:
-                    raise ValueError("None cannot be a node")
-                self._adj[n] = self.adjlist_inner_dict_factory()
-                self._node[n] = self.node_attr_dict_factory()
-            self._node[n].update(newdict)
-        nx._clear_cache(self)
+        with self._batch():
+            for n in nodes_for_adding:
+                try:
+                    newnode = n not in self._node
+                    newdict = attr
+                except TypeError:
+                    n, ndict = n
+                    newnode = n not in self._node
+                    newdict = attr.copy()
+                    newdict.update(ndict)
+                if newnode:
+                    if n is None:
+                        raise ValueError("None cannot be a node")
+                    self._adj[n] = self.adjlist_inner_dict_factory()
+                    self._node[n] = self.node_attr_dict_factory()
+                self._node[n].update(newdict)
 
     def remove_node(self, n):
         """Remove node n.
@@ -697,7 +898,7 @@ class Graph:
         for u in nbrs:
             del adj[u][n]  # remove all edges n-u in graph
         del adj[n]  # now remove node
-        nx._clear_cache(self)
+        self._mutation_done()
 
     def remove_nodes_from(self, nodes):
         """Remove multiple nodes.
@@ -742,15 +943,15 @@ class Graph:
         >>> G.remove_nodes_from(list(n for n in G.nodes if n < 2))
         """
         adj = self._adj
-        for n in nodes:
-            try:
-                del self._node[n]
-                for u in list(adj[n]):  # list handles self-loops
-                    del adj[u][n]  # (allows mutation of dict in loop)
-                del adj[n]
-            except KeyError:
-                pass
-        nx._clear_cache(self)
+        with self._batch():
+            for n in nodes:
+                try:
+                    del self._node[n]
+                    for u in list(adj[n]):  # list handles self-loops
+                        del adj[u][n]  # (allows mutation of dict in loop)
+                    del adj[n]
+                except KeyError:
+                    pass
 
     @cached_property
     def nodes(self):
@@ -980,7 +1181,7 @@ class Graph:
         datadict.update(attr)
         self._adj[u][v] = datadict
         self._adj[v][u] = datadict
-        nx._clear_cache(self)
+        self._mutation_done()
 
     def add_edges_from(self, ebunch_to_add, **attr):
         """Add all the edges in ebunch_to_add.
@@ -1037,31 +1238,33 @@ class Graph:
         >>> # correct way - note that there will be no self-edge for node 5
         >>> G.add_edges_from(list((5, n) for n in G.nodes))
         """
-        for e in ebunch_to_add:
-            ne = len(e)
-            if ne == 3:
-                u, v, dd = e
-            elif ne == 2:
-                u, v = e
-                dd = {}  # doesn't need edge_attr_dict_factory
-            else:
-                raise nx.NetworkXError(f"Edge tuple {e} must be a 2-tuple or 3-tuple.")
-            if u not in self._node:
-                if u is None:
-                    raise ValueError("None cannot be a node")
-                self._adj[u] = self.adjlist_inner_dict_factory()
-                self._node[u] = self.node_attr_dict_factory()
-            if v not in self._node:
-                if v is None:
-                    raise ValueError("None cannot be a node")
-                self._adj[v] = self.adjlist_inner_dict_factory()
-                self._node[v] = self.node_attr_dict_factory()
-            datadict = self._adj[u].get(v, self.edge_attr_dict_factory())
-            datadict.update(attr)
-            datadict.update(dd)
-            self._adj[u][v] = datadict
-            self._adj[v][u] = datadict
-        nx._clear_cache(self)
+        with self._batch():
+            for e in ebunch_to_add:
+                ne = len(e)
+                if ne == 3:
+                    u, v, dd = e
+                elif ne == 2:
+                    u, v = e
+                    dd = {}  # doesn't need edge_attr_dict_factory
+                else:
+                    raise nx.NetworkXError(
+                        f"Edge tuple {e} must be a 2-tuple or 3-tuple."
+                    )
+                if u not in self._node:
+                    if u is None:
+                        raise ValueError("None cannot be a node")
+                    self._adj[u] = self.adjlist_inner_dict_factory()
+                    self._node[u] = self.node_attr_dict_factory()
+                if v not in self._node:
+                    if v is None:
+                        raise ValueError("None cannot be a node")
+                    self._adj[v] = self.adjlist_inner_dict_factory()
+                    self._node[v] = self.node_attr_dict_factory()
+                datadict = self._adj[u].get(v, self.edge_attr_dict_factory())
+                datadict.update(attr)
+                datadict.update(dd)
+                self._adj[u][v] = datadict
+                self._adj[v][u] = datadict
 
     def add_weighted_edges_from(self, ebunch_to_add, weight="weight", **attr):
         """Add weighted edges in `ebunch_to_add` with specified weight attr
@@ -1111,8 +1314,10 @@ class Graph:
         >>> # correct way - note that there will be no self-edge for node 5
         >>> G.add_weighted_edges_from(list((5, n, weight) for n in G.nodes))
         """
-        self.add_edges_from(((u, v, {weight: d}) for u, v, d in ebunch_to_add), **attr)
-        nx._clear_cache(self)
+        with self._batch():
+            self.add_edges_from(
+                ((u, v, {weight: d}) for u, v, d in ebunch_to_add), **attr
+            )
 
     def remove_edge(self, u, v):
         """Remove the edge between u and v.
@@ -1146,7 +1351,7 @@ class Graph:
                 del self._adj[v][u]
         except KeyError as err:
             raise nx.NetworkXError(f"The edge {u}-{v} is not in the graph") from err
-        nx._clear_cache(self)
+        self._mutation_done()
 
     def remove_edges_from(self, ebunch):
         """Remove all edges specified in ebunch.
@@ -1175,13 +1380,13 @@ class Graph:
         >>> G.remove_edges_from(ebunch)
         """
         adj = self._adj
-        for e in ebunch:
-            u, v = e[:2]  # ignore edge data if present
-            if u in adj and v in adj[u]:
-                del adj[u][v]
-                if u != v:  # self loop needs only one entry removed
-                    del adj[v][u]
-        nx._clear_cache(self)
+        with self._batch():
+            for e in ebunch:
+                u, v = e[:2]  # ignore edge data if present
+                if u in adj and v in adj[u]:
+                    del adj[u][v]
+                    if u != v:  # self loop needs only one entry removed
+                        del adj[v][u]
 
     def update(self, edges=None, nodes=None):
         """Update the graph using nodes/edges/graphs as input.
@@ -1278,26 +1483,27 @@ class Graph:
         add_edges_from: add multiple edges to a graph
         add_nodes_from: add multiple nodes to a graph
         """
-        if edges is not None:
-            if nodes is not None:
-                self.add_nodes_from(nodes)
-                self.add_edges_from(edges)
-            else:
-                # check if edges is a Graph object
-                try:
-                    graph_nodes = edges.nodes
-                    graph_edges = edges.edges
-                except AttributeError:
-                    # edge not Graph-like
+        with self._batch():
+            if edges is not None:
+                if nodes is not None:
+                    self.add_nodes_from(nodes)
                     self.add_edges_from(edges)
-                else:  # edges is Graph-like
-                    self.add_nodes_from(graph_nodes.data())
-                    self.add_edges_from(graph_edges.data())
-                    self.graph.update(edges.graph)
-        elif nodes is not None:
-            self.add_nodes_from(nodes)
-        else:
-            raise nx.NetworkXError("update needs nodes or edges input")
+                else:
+                    # check if edges is a Graph object
+                    try:
+                        graph_nodes = edges.nodes
+                        graph_edges = edges.edges
+                    except AttributeError:
+                        # edge not Graph-like
+                        self.add_edges_from(edges)
+                    else:  # edges is Graph-like
+                        self.add_nodes_from(graph_nodes.data())
+                        self.add_edges_from(graph_edges.data())
+                        self.graph.update(edges.graph)
+            elif nodes is not None:
+                self.add_nodes_from(nodes)
+            else:
+                raise nx.NetworkXError("update needs nodes or edges input")
 
     def has_edge(self, u, v):
         """Returns True if the edge (u, v) is in the graph.
@@ -1562,7 +1768,7 @@ class Graph:
         self._adj.clear()
         self._node.clear()
         self.graph.clear()
-        nx._clear_cache(self)
+        self._mutation_done()
 
     def clear_edges(self):
         """Remove all edges from the graph without altering nodes.
@@ -1578,7 +1784,7 @@ class Graph:
         """
         for nbr_dict in self._adj.values():
             nbr_dict.clear()
-        nx._clear_cache(self)
+        self._mutation_done()
 
     def is_multigraph(self):
         """Returns True if graph is a multigraph, False otherwise."""
