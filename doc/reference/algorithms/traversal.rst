@@ -61,3 +61,15 @@ Breadth First Search on Edges
    :toctree: generated/
 
    edge_bfs
+
+Resumable traversals
+--------------------
+.. automodule:: networkx.algorithms.traversal.resumable
+.. autosummary::
+   :toctree: generated/
+
+   ResumableTraversal
+   resumable_bfs_edges
+   resumable_dfs_edges
+   resumable_edge_bfs
+   resumable_edge_dfs

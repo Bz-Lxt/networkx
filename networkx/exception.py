@@ -13,6 +13,7 @@ __all__ = [
     "ExceededMaxIterations",
     "AmbiguousSolution",
     "NetworkXAlgorithmError",
+    "NetworkXCheckpointError",
     "NetworkXException",
     "NetworkXError",
     "NetworkXNoCycle",
@@ -56,6 +57,16 @@ class NetworkXPointlessConcept(NetworkXException):
 
 class NetworkXAlgorithmError(NetworkXException):
     """Exception for unexpected termination of algorithms."""
+
+
+class NetworkXCheckpointError(NetworkXError):
+    """Exception raised when a traversal checkpoint cannot be used to resume.
+
+    This is raised when a checkpoint was created with an incompatible state
+    version, when the graph has changed since the checkpoint was taken, or when
+    the traversal parameters used for resumption do not match those recorded
+    in the checkpoint.
+    """
 
 
 class NetworkXUnfeasible(NetworkXAlgorithmError):

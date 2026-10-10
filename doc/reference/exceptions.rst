@@ -13,6 +13,8 @@ Exceptions
 
 .. autoclass:: networkx.NetworkXAlgorithmError
 
+.. autoclass:: networkx.NetworkXCheckpointError
+
 .. autoclass:: networkx.NetworkXUnfeasible
 
 .. autoclass:: networkx.NetworkXNoPath
