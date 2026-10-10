@@ -1,8 +1,13 @@
 import collections
+import contextvars
 import typing
 from dataclasses import dataclass
 
 __all__ = ["Config"]
+
+# Sentinel marking a config item deleted within a context frame (non-strict
+# configs may add and delete items)
+_DELETED = object()
 
 
 @dataclass(init=False, eq=False, slots=True, kw_only=True, match_args=False)
@@ -48,6 +53,13 @@ class Config:
     >>> print("spam (after context):", cfg.spam)
     spam (after context): 42
 
+    Config contexts are independent across threads and asynchronous tasks
+    (they use :mod:`contextvars`), so temporarily changing configs in one
+    thread or task doesn't affect the others, and nested contexts each restore
+    their previous values on exit, including when an exception is raised.
+    Assigning directly to a config item (outside of a context) still sets the
+    process-wide default value.
+
     Subclasses may also define ``_on_setattr`` (as done in the example above)
     to ensure the value being assigned is valid:
 
@@ -88,12 +100,44 @@ class Config:
         )(cls)
         if not cls._strict:
             cls.__repr__ = _flexible_repr
+        # Add a per-instance slot for the context-local frame stack. We can't
+        # define the slot on `Config` itself because `dataclass(slots=True)`
+        # recreates this class, and class-level storage would be shared between
+        # threads and between instances of a non-strict subclass.
+        cls = type(
+            cls.__name__,
+            (cls,),
+            {
+                "__qualname__": cls.__qualname__,
+                "__doc__": cls.__doc__,
+                "__slots__": ("_context_var",),
+            },
+            strict=cls._strict,
+        )
         cls._orig_class = orig_class  # Save original class so we can pickle
-        cls._prev = None  # Stage previous configs to enable use as context manager
-        cls._context_stack = []  # Stack of previous configs when used as context
         instance = object.__new__(cls)
+        object.__setattr__(
+            instance,
+            "_context_var",
+            contextvars.ContextVar(
+                f"_{orig_class.__name__}_config_frames_{id(instance):x}"
+            ),
+        )
         instance.__init__(**kwargs)
         return instance
+
+    def _get_frames(self):
+        """The stack of active config frames in the current context, or None.
+
+        Each frame is a ``(data, entered)`` tuple where ``data`` is a dict of
+        the effective config items for that scope (values may be the
+        ``_DELETED`` sentinel) and ``entered`` records whether ``__enter__``
+        has been called (i.e. the frame isn't merely staged by ``__call__``).
+        """
+        return object.__getattribute__(self, "_context_var").get(None)
+
+    def _set_frames(self, frames):
+        object.__getattribute__(self, "_context_var").set(frames)
 
     def _on_setattr(self, key, value):
         """Process config value and check whether it is valid. Useful for subclasses."""
@@ -106,36 +150,88 @@ class Config:
     def __dir__(self):
         return self.__dataclass_fields__.keys()
 
+    def __getattribute__(self, name):
+        # Resolve config items from the active frame of the current thread or
+        # async task when a config context is active. Everything else (dunder
+        # names, private state, methods) is resolved normally.
+        if not name.startswith("_"):
+            frames = object.__getattribute__(self, "_context_var").get(None)
+            if frames is not None:
+                frame = frames[-1][0]
+                if name in frame:
+                    value = frame[name]
+                    if value is _DELETED:
+                        raise AttributeError(name)
+                    return value
+        return object.__getattribute__(self, name)
+
     def __setattr__(self, key, value):
         if self._strict and key not in self.__dataclass_fields__:
             raise AttributeError(f"Invalid config name: {key!r}")
         value = self._on_setattr(key, value)
-        object.__setattr__(self, key, value)
-        self.__class__._prev = None
+        frames = self._get_frames()
+        if frames is None:
+            object.__setattr__(self, key, value)
+            return
+        # Copy the frame on write so contexts copied via contextvars (e.g.
+        # asyncio tasks) keep their own independent frame data.
+        data, entered = frames[-1]
+        data = dict(data)
+        data[key] = value
+        self._set_frames(frames[:-1] + ((data, entered),))
 
     def __delattr__(self, key):
         if self._strict:
             raise TypeError(
                 f"Configuration items can't be deleted (can't delete {key!r})."
             )
+        frames = self._get_frames()
+        if frames is None:
+            self._on_delattr(key)
+            object.__delattr__(self, key)
+            return
+        data, entered = frames[-1]
+        if key not in data or data[key] is _DELETED:
+            raise AttributeError(key)
         self._on_delattr(key)
-        object.__delattr__(self, key)
-        self.__class__._prev = None
+        data = dict(data)
+        data[key] = _DELETED
+        self._set_frames(frames[:-1] + ((data, entered),))
 
     # Be a `collection.abc.Collection`
     def __contains__(self, key):
-        return (
-            key in self.__dataclass_fields__ if self._strict else key in self.__dict__
-        )
+        if self._strict:
+            return key in self.__dataclass_fields__
+        frames = self._get_frames()
+        if frames is not None:
+            value = frames[-1][0].get(key, _DELETED)
+            return value is not _DELETED
+        return key in self.__dict__
 
     def __iter__(self):
-        return iter(self.__dataclass_fields__ if self._strict else self.__dict__)
+        if self._strict:
+            return iter(self.__dataclass_fields__)
+        frames = self._get_frames()
+        if frames is not None:
+            return iter(
+                key for key, value in frames[-1][0].items() if value is not _DELETED
+            )
+        return iter(self.__dict__)
 
     def __len__(self):
-        return len(self.__dataclass_fields__ if self._strict else self.__dict__)
+        if self._strict:
+            return len(self.__dataclass_fields__)
+        return sum(1 for _ in self)
 
     def __reversed__(self):
-        return reversed(self.__dataclass_fields__ if self._strict else self.__dict__)
+        if self._strict:
+            return reversed(self.__dataclass_fields__)
+        frames = self._get_frames()
+        if frames is not None:
+            return reversed(
+                [key for key, value in frames[-1][0].items() if value is not _DELETED]
+            )
+        return reversed(self.__dict__)
 
     # Add dunder methods for `collections.abc.Mapping`
     def __getitem__(self, key):
@@ -188,14 +284,18 @@ class Config:
     # Allow to be used as context manager
     def __call__(self, **kwargs):
         kwargs = {key: self._on_setattr(key, val) for key, val in kwargs.items()}
-        prev = dict(self)
-        for key, val in kwargs.items():
-            setattr(self, key, val)
-        self.__class__._prev = prev
+        frames = self._get_frames()
+        # Snapshot the effective config of the current scope and overlay the
+        # new values as a new frame. Frames live in a ContextVar, so they are
+        # local to the current thread or async task.
+        frame = dict(self)
+        frame.update(kwargs)
+        self._set_frames((frames or ()) + ((frame, False),))
         return self
 
     def __enter__(self):
-        if self.__class__._prev is None:
+        frames = self._get_frames()
+        if frames is None or frames[-1][1]:
             raise RuntimeError(
                 "Config being used as a context manager without config items being set. "
                 "Set config items via keyword arguments when calling the config object. "
@@ -203,20 +303,22 @@ class Config:
                 '    >>> with cfg(breakfast="spam"):\n'
                 "    ...     ...  # Do stuff\n"
             )
-        self.__class__._context_stack.append(self.__class__._prev)
-        self.__class__._prev = None
+        data, _ = frames[-1]
+        self._set_frames(frames[:-1] + ((data, True),))
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
-        prev = self.__class__._context_stack.pop()
-        for key, val in prev.items():
-            setattr(self, key, val)
+        frames = self._get_frames()
+        if frames is not None:
+            # Pop the frame whether or not the body raised. The previous frame
+            # (or the process-wide defaults) becomes visible again.
+            self._set_frames(frames[:-1] or None)
 
 
 def _flexible_repr(self):
     return (
         f"{self.__class__.__qualname__}("
-        + ", ".join(f"{key}={val!r}" for key, val in self.__dict__.items())
+        + ", ".join(f"{key}={val!r}" for key, val in self.items())
         + ")"
     )
 
@@ -336,7 +438,12 @@ class NetworkXConfig(Config):
     - ``NETWORKX_BACKEND_PRIORITY_ALGOS``: same as ``NETWORKX_BACKEND_PRIORITY``
       to set ``backend_priority.algos``.
 
-    This is a global configuration. Use with caution when using from multiple threads.
+    This is a process-wide global configuration: assigning directly to a
+    config item (e.g. ``nx.config.fallback_to_nx = True``) changes the default
+    for every thread and task. To change configuration temporarily, use the
+    config as a context manager (e.g. ``with nx.config(fallback_to_nx=True):``);
+    such changes are local to the current thread and asynchronous task, may be
+    nested, and are restored on exit even if an exception is raised.
     """
 
     backend_priority: BackendPriorities

@@ -1,5 +1,7 @@
+import asyncio
 import collections
 import pickle
+import threading
 
 import pytest
 
@@ -248,16 +250,182 @@ def test_context():
     c = cfg(x=4)  # Not yet as context (not recommended, but possible)
     assert c == cfg
     assert cfg.x == 4
-    # Cheat by looking at internal data; context stack should only grow with __enter__
-    assert cfg._prev is not None
-    assert cfg._context_stack == []
+    # Cheat by looking at internal data: calling the config stages a frame,
+    # and that frame is only marked as entered by __enter__
+    frames = cfg._get_frames()
+    assert frames is not None
+    assert len(frames) == 1
+    assert frames[-1][1] is False
     with c:
         assert c == cfg
         assert cfg.x == 4
+        assert cfg._get_frames()[-1][1] is True
     assert cfg.x == 1
     # Cheat again; there was no preceding `cfg(...)` call this time
-    assert cfg._prev is None
+    assert cfg._get_frames() is None
     with pytest.raises(RuntimeError, match="context manager without"):
         with cfg:
             pass
     assert cfg.x == 1
+
+
+def test_context_restores_on_exception():
+    cfg = Config(x=1)
+    with pytest.raises(ValueError, match="boom"):
+        with cfg(x=2):
+            assert cfg.x == 2
+            with cfg(x=3):
+                assert cfg.x == 3
+                raise ValueError("boom")
+    # Each nested scope is restored even though the innermost one raised
+    assert cfg.x == 1
+    # A context manager is still usable after a previous one raised
+    with cfg(x=4):
+        assert cfg.x == 4
+    assert cfg.x == 1
+
+
+def test_context_thread_isolation():
+    cfg = Config(x=1)
+    errors = []
+    entered = threading.Barrier(2, timeout=5)
+
+    def worker(value):
+        try:
+            with cfg(x=value):
+                entered.wait()
+                assert cfg.x == value
+                with cfg(x=value * 10):
+                    assert cfg.x == value * 10
+                assert cfg.x == value
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=worker, args=(10,))
+    thread.start()
+    try:
+        with cfg(x=2):
+            entered.wait()
+            # The other thread's temporary value must not leak into this thread
+            assert cfg.x == 2
+        assert cfg.x == 1
+    finally:
+        thread.join()
+    assert not errors
+    assert cfg.x == 1
+
+
+def test_context_does_not_leak_to_other_threads():
+    cfg = Config(x=1)
+    seen = []
+    started = threading.Event()
+    finish = threading.Event()
+
+    def worker():
+        with cfg(x=10):
+            started.set()
+            finish.wait(timeout=5)
+            seen.append(cfg.x)
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    started.wait(timeout=5)
+    # No context is active in this thread: the worker's temporary override
+    # must not change the value seen here
+    assert cfg.x == 1
+    finish.set()
+    thread.join()
+    assert seen == [10]
+    assert cfg.x == 1
+
+
+def test_context_thread_restores_on_exception():
+    cfg = Config(x=1)
+    errors = []
+
+    def worker():
+        try:
+            with cfg(x=10):
+                raise RuntimeError("boom")
+        except RuntimeError as exc:
+            errors.append(exc)
+        assert cfg.x == 1
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    thread.join()
+    assert cfg.x == 1
+    assert len(errors) == 1
+
+
+def test_context_asyncio_isolation():
+    cfg = Config(x=1)
+
+    async def task(value):
+        with cfg(x=value):
+            await asyncio.sleep(0.01)
+            assert cfg.x == value
+
+    async def main():
+        with cfg(x=5):
+            await asyncio.gather(task(10), task(20))
+            # Overrides in the concurrently running tasks don't leak here
+            assert cfg.x == 5
+        assert cfg.x == 1
+
+    asyncio.run(main())
+    assert cfg.x == 1
+
+
+def test_context_asyncio_inherits_and_restores():
+    cfg = Config(x=1)
+
+    async def task():
+        # A task starts in a copy of the parent's context, so it sees the
+        # parent's active frame, but can't affect the parent with its own
+        assert cfg.x == 5
+        with cfg(x=9):
+            assert cfg.x == 9
+        assert cfg.x == 5
+
+    async def main():
+        with cfg(x=5):
+            await asyncio.create_task(task())
+            assert cfg.x == 5
+        assert cfg.x == 1
+
+    asyncio.run(main())
+
+
+def test_nxconfig_context_thread_isolation():
+    errors = []
+    entered = threading.Barrier(2, timeout=5)
+    default_fallback = nx.config.fallback_to_nx
+    default_cache = nx.config.cache_converted_graphs
+
+    def worker():
+        try:
+            with nx.config(
+                fallback_to_nx=not default_fallback,
+                cache_converted_graphs=not default_cache,
+            ):
+                entered.wait()
+                assert nx.config.fallback_to_nx is (not default_fallback)
+                assert nx.config.cache_converted_graphs is (not default_cache)
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    try:
+        with nx.config(
+            fallback_to_nx=default_fallback, cache_converted_graphs=default_cache
+        ):
+            entered.wait()
+            assert nx.config.fallback_to_nx is default_fallback
+            assert nx.config.cache_converted_graphs is default_cache
+    finally:
+        thread.join()
+    assert not errors
+    assert nx.config.fallback_to_nx is default_fallback
+    assert nx.config.cache_converted_graphs is default_cache
